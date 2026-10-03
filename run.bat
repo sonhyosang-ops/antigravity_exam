@@ -13,6 +13,15 @@ if %errorlevel% neq 0 (
     exit /b
 )
 
+:: 2. 환경 설정 파일(.env) 확인
+if not exist .env (
+    if exist .env.example (
+        copy .env.example .env > nul
+        echo [.env 생성] .env 파일이 자동 생성되었습니다.
+        echo 메모장으로 .env 파일을 열어 실제 UPSTAGE_API_KEY를 입력해주세요!
+    )
+)
+
 :: 2. 필수 라이브러리 자동 설치
 echo [1/2] 필수 라이브러리 확인 및 설치 중...
 pip install -r requirements.txt -q
