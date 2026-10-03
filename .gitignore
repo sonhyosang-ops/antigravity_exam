@@ -1,0 +1,26 @@
+# 보안 환경 변수 파일 (API Key 등 절대 커밋 금지)
+.env
+.env.local
+.env.*.local
+.streamlit/secrets.toml
+
+# 파이썬 캐시 및 가상환경
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+
+# OS 및 IDE 파일
+.DS_Store
+.vscode/
+.idea/
+.claude/
+
+# 시험 결과 및 임시 파일
+*.xlsx
+scratch/
