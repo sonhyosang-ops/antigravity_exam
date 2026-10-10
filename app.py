@@ -3,6 +3,7 @@ import io
 import json
 import streamlit as st
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 
 # 로컬 모듈 임포트
@@ -94,9 +95,30 @@ if "excel_data" not in st.session_state:
     st.session_state.excel_data = None
 
 # 보안 키 확인 (화면에 절대 키를 입력받지 않음)
-load_dotenv(override=True)
 secret_key = get_secret_api_key()
 has_valid_key = bool(secret_key and secret_key != "your_upstage_api_key_here")
+
+
+# ----------------- 엑셀 리포트 캐시 -----------------
+# 위젯을 조작할 때마다(재실행) 엑셀을 다시 만들지 않도록, 내용이 바뀐 경우에만 재생성
+@st.cache_data(show_spinner=False, max_entries=8)
+def cached_all_feedback_report(criteria_json: str, students_json: str) -> bytes:
+    return ExcelReportGenerator.generate_all_feedback_report(
+        criteria_data=json.loads(criteria_json),
+        graded_students=json.loads(students_json),
+    )
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def cached_student_feedback_report(student_json: str, criteria_json: str) -> bytes:
+    return ExcelReportGenerator.generate_student_feedback_report(
+        student=json.loads(student_json),
+        criteria_data=json.loads(criteria_json),
+    )
+
+
+def _to_json(obj) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
 
 
 # ----------------- 사이드바 설정 -----------------
@@ -232,19 +254,18 @@ if parse_trigger:
                         raise ValueError("엑셀에서 문항을 찾지 못함")
                 except Exception:
                     # 엑셀 직접 읽기 실패 시 Upstage로 폴백
-                    a_file.seek(0)
                     parsed_criteria = criteria_parser.parse_three_materials(
-                        answer_key_content=a_file.read(),
+                        answer_key_content=a_file.getvalue(),
                         answer_key_name=a_file.name
                     )
             else:
-                q_bytes = q_file.read() if q_file else None
+                q_bytes = q_file.getvalue() if q_file else None
                 q_name = q_file.name if q_file else "question.pdf"
                 
-                t_bytes = t_file.read() if t_file else None
+                t_bytes = t_file.getvalue() if t_file else None
                 t_name = t_file.name if t_file else "template.pdf"
                 
-                a_bytes = a_file.read() if a_file else None
+                a_bytes = a_file.getvalue() if a_file else None
                 a_name = a_file.name if a_file else "answer_key.pdf"
 
                 parsed_criteria = criteria_parser.parse_three_materials(
@@ -318,29 +339,44 @@ if st.session_state.criteria_data and len(st.session_state.criteria_data.get("it
         if start_grade_btn:
             progress_bar = st.progress(0)
             status_text = st.empty()
-            graded_list = []
-            
-            for i, s_file in enumerate(student_files):
-                status_text.text(f"[{i+1}/{len(student_files)}] '{s_file.name}' 손글씨 답안 인식 및 채점 진행 중...")
-                try:
-                    s_bytes = s_file.read()
-                    # 1. OCR 인식 및 학생 정보/답안 추출
-                    student_info = grader.parse_student_sheet(
-                        file_content=s_bytes,
-                        filename=s_file.name,
-                        criteria_data=st.session_state.criteria_data,
-                        default_department=default_dept
-                    )
-                    # 2. 채점 실행
-                    graded_res = grader.grade_student(student_info, st.session_state.criteria_data)
-                    graded_list.append(graded_res)
-                except Exception as e:
-                    import traceback
-                    traceback.print_exc()
-                    st.error(f"'{s_file.name}' 처리 실패: {str(e)}")
-                    
-                progress_bar.progress((i + 1) / len(student_files))
-                
+            criteria_snapshot = st.session_state.criteria_data
+            total_files = len(student_files)
+            # 업로드 순서 유지를 위해 인덱스별 결과 슬롯
+            results_by_idx = [None] * total_files
+            errors = []
+
+            def _grade_one(file_bytes: bytes, file_name: str):
+                # 워커 스레드에서는 st.* 호출 금지 — 순수 계산만 수행
+                info = grader.parse_student_sheet(
+                    file_content=file_bytes,
+                    filename=file_name,
+                    criteria_data=criteria_snapshot,
+                    default_department=default_dept
+                )
+                return grader.grade_student(info, criteria_snapshot)
+
+            status_text.text(f"총 {total_files}부 답안지를 병렬로 인식·채점 중입니다...")
+            done = 0
+            with ThreadPoolExecutor(max_workers=min(grader.parallel_workers, total_files)) as pool:
+                futures = {
+                    pool.submit(_grade_one, f.getvalue(), f.name): (i, f.name)
+                    for i, f in enumerate(student_files)
+                }
+                for fut in as_completed(futures):
+                    i, fname = futures[fut]
+                    try:
+                        results_by_idx[i] = fut.result()
+                    except Exception as e:
+                        import traceback
+                        traceback.print_exc()
+                        errors.append(f"'{fname}' 처리 실패: {str(e)}")
+                    done += 1
+                    progress_bar.progress(done / total_files)
+                    status_text.text(f"[{done}/{total_files}] '{fname}' 채점 완료")
+
+            for msg in errors:
+                st.error(msg)
+            graded_list = [r for r in results_by_idx if r is not None]
             if graded_list:
                 status_text.text(f"🎉 총 {len(graded_list)}명의 학생 답안 채점이 완료되었습니다!")
                 st.session_state.graded_students = graded_list
@@ -379,9 +415,9 @@ if st.session_state.graded_students:
                 help="구글 스프레드시트 규격 3행 헤더 및 학과별 분할 시트가 적용된 성적표입니다."
             )
         with dl_col_main2:
-            all_fb_bytes = ExcelReportGenerator.generate_all_feedback_report(
-                criteria_data=st.session_state.criteria_data,
-                graded_students=st.session_state.graded_students
+            all_fb_bytes = cached_all_feedback_report(
+                _to_json(st.session_state.criteria_data),
+                _to_json(st.session_state.graded_students),
             )
             st.download_button(
                 label="📊 전체 학생 상세 피드백 & 정오표 종합 (.xlsx)",
@@ -652,13 +688,13 @@ if st.session_state.graded_students:
     st.markdown("##### 📥 수기 검토 및 채점 피드백 자료 다운로드")
     st.caption("채점자가 수기 확정한 정오/득점 및 AI 채점 피드백(오답 사유, 기준 비교 등)이 포함된 상세 리포트를 다운로드할 수 있습니다.")
 
-    single_student_bytes = ExcelReportGenerator.generate_student_feedback_report(
-        student=target_student,
-        criteria_data=st.session_state.criteria_data
+    single_student_bytes = cached_student_feedback_report(
+        _to_json(target_student),
+        _to_json(st.session_state.criteria_data),
     )
-    all_student_bytes = ExcelReportGenerator.generate_all_feedback_report(
-        criteria_data=st.session_state.criteria_data,
-        graded_students=st.session_state.graded_students
+    all_student_bytes = cached_all_feedback_report(
+        _to_json(st.session_state.criteria_data),
+        _to_json(st.session_state.graded_students),
     )
 
     clean_sname = str(target_student.get('name', '학생')).replace(' ', '_')

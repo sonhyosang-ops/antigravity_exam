@@ -144,9 +144,10 @@ class StudentGrader:
         client: UpstageClient,
         *,
         max_retries: int = 3,
-        parallel_workers: int = 4,
+        parallel_workers: int = 3,
+        llm_workers: int = 4,
         short_answer_llm_rejudge: bool = True,
-        crop_answer_ratio: float = 0.30,
+        crop_answer_ratio: float = 0.0,
         target_min_px: int = 2000,
         deskew_verify_sample: Optional[str] = None,
         enable_english_cleanup: bool = True,
@@ -157,9 +158,10 @@ class StudentGrader:
         client: UpstageClient 인스턴스 (parse_document, call_solar 제공)
         max_retries: API 호출 실패 시 재시도 횟수
         parallel_workers: 여러 답안지 병렬 처리 스레드 수
+        llm_workers: 한 학생 내 문항별 LLM 채점(서술형/단답형 재판단) 동시 호출 수
         short_answer_llm_rejudge: 단답형 완전 불일치 시 자모/철자 혼동 2차 판별 사용 여부
         crop_answer_ratio: 전처리 시 답변 영역 확보를 위해 상단을 제거할 비율(0~1).
-                            답안지 배치에 맞게 조정 — 기본값은 질문 상단 30% 제거 예시
+                            주의: 상단에 학과/학번/성명이 있는 답안지는 0으로 두어야 함(기본값 0)
         target_min_px: 전처리 후 긴 축 최소 픽셀 수(OCR 해상도 여유)
         deskew_verify_sample: 기울기 보정 방향이 맞는지 확인할 샘플 이미지 경로.
                               제공 시 해당 이미지로 한 번 테스트해 회전 방향을 보정 시도.
@@ -168,6 +170,7 @@ class StudentGrader:
         self.client = client
         self.max_retries = max_retries
         self.parallel_workers = parallel_workers
+        self.llm_workers = max(1, llm_workers)
         self.short_answer_llm_rejudge = short_answer_llm_rejudge
         self.crop_answer_ratio = crop_answer_ratio
         self.target_min_px = target_min_px
@@ -212,6 +215,8 @@ class StudentGrader:
         ext = filename.lower().split(".")[-1]
         if ext not in ("jpg", "jpeg", "png", "bmp", "tiff", "webp"):
             return file_content  # PDF 등 그대로 통과
+        if cv2 is None:
+            return file_content  # OpenCV 미설치 시 전처리 생략
 
         try:
             img = Image.open(io.BytesIO(file_content))
@@ -233,12 +238,13 @@ class StudentGrader:
             arr = cv2.medianBlur(arr, 3)
 
             # 2) 적응형 이진화 (연필·볼펜·조명 편차 대응)
+            #    ※ OpenCV는 키워드 인자(block_size=)를 받지 않아 기존 코드가 항상 실패했음 → 위치 인자로 수정
             bw = cv2.adaptiveThreshold(
                 arr, 255,
                 cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                 cv2.THRESH_BINARY,
-                block_size=31,
-                C=15,
+                31,  # blockSize
+                15,  # C
             )
 
             # 3) 기울기 보정
@@ -268,15 +274,21 @@ class StudentGrader:
 
     def _deskew(self, bw: np.ndarray) -> np.ndarray:
         """minAreaRect 기반 기울기 보정. 회전 방향이 틀리면 _deskew_flip로 보정."""
-        coords = cv2.findNonZero(bw < 128)
+        coords = cv2.findNonZero((bw < 128).astype(np.uint8))
         if coords is None or len(coords) < 50:
             return bw  # 텍스트 영역 부족 → 보정 생략
 
         angle = cv2.minAreaRect(coords)[-1]
-        if angle < -45:
-            angle = -(angle + 90)
-        else:
-            angle = -angle
+        # OpenCV 버전별 각도 범위(-90~0 / 0~90) 차이를 [-45, 45]로 정규화
+        while angle > 45:
+            angle -= 90
+        while angle < -45:
+            angle += 90
+        angle = -angle
+
+        # 미세하거나(불필요) 과도한(오감지 가능성) 각도는 회전하지 않음
+        if abs(angle) < 0.3 or abs(angle) > 15:
+            return bw
 
         if self._deskew_flip:
             angle = -angle
@@ -510,9 +522,9 @@ class StudentGrader:
         while start < len(text):
             end = min(start + max_chunk, len(text))
             chunks.append(text[start:end])
+            if end >= len(text):
+                break  # 마지막 청크 — 기존 코드는 여기서 무한 루프에 빠졌음
             start = end - overlap
-            if start <= 0:
-                break
         return chunks
 
     # ------------------------------------------------------------------
@@ -530,11 +542,45 @@ class StudentGrader:
     # ------------------------------------------------------------------
     @staticmethod
     def _extract_doc_text(doc_result: dict) -> str:
-        if "content" in doc_result and "html" in doc_result["content"]:
-            return doc_result["content"]["html"]
+        content = doc_result.get("content") or {}
+        if content.get("markdown"):
+            return content["markdown"]
+        if content.get("html"):
+            return content["html"]
         if "elements" in doc_result:
             return "\n".join(el.get("text", "") for el in doc_result["elements"])
         return str(doc_result)
+
+    # ------------------------------------------------------------------
+    # LLM 채점 단일 호출 (병렬 실행용)
+    # ------------------------------------------------------------------
+    def _llm_judge(
+        self,
+        prompt: str,
+        system_instruction: str,
+        max_score: float,
+        default_feedback: str,
+        error_feedback: Optional[str],
+        label: str,
+    ) -> Dict[str, Any]:
+        """문항 1개를 LLM으로 채점. error_feedback이 None이면 '자동 채점 오류: ...' 사용."""
+        try:
+            res = self._retry(
+                self.client.call_solar,
+                prompt=prompt,
+                system_instruction=system_instruction,
+                temperature=0.0,
+                response_format_json=True,
+            )
+            res_json = self._parse_json_response(res)
+            score = max(0.0, min(max_score, float(res_json.get("score", 0.0))))
+            status = str(res_json.get("status", "X")).upper()
+            feedback = str(res_json.get("feedback", default_feedback))
+        except Exception as e:
+            LOG.warning(f"{label} 오류: {e}")
+            score, status = 0.0, "X"
+            feedback = error_feedback if error_feedback is not None else f"자동 채점 오류: {e}"
+        return {"score": score, "status": status, "feedback": feedback, "needs_review": False}
 
     # ------------------------------------------------------------------
     # 채점 ① — OCR 파싱 → 학생 정보·답안 추출
@@ -677,6 +723,7 @@ class StudentGrader:
         graded_results: Dict[str, Any] = {}
         total_student_score = 0.0
         review_queue: List[Dict[str, Any]] = []  # 인간 확인용 큐
+        llm_jobs: List[tuple] = []  # (item_no, raw_ans, _llm_judge kwargs) — 루프 후 병렬 실행
 
         for item_no, crit in criteria_items.items():
             max_score = float(crit.get("score", 0))
@@ -834,30 +881,15 @@ class StudentGrader:
   "feedback": "상세 채점 피드백 (1문장)"
 }}
 """
-                        try:
-                            judge_res = self._retry(
-                                self.client.call_solar,
-                                prompt=rejudge_prompt,
-                                temperature=0.0,
-                                response_format_json=True,
-                            )
-                            res_json = self._parse_json_response(judge_res)
-                            score = max(0.0, min(max_score, float(res_json.get("score", 0.0))))
-                            status = str(res_json.get("status", "X")).upper()
-                            feedback = str(res_json.get("feedback", f"오답: 정답 후보({', '.join(candidates)})와 불일치"))
-                        except Exception as e:
-                            LOG.warning(f"단답형 재판단 오류({item_no}): {e}")
-                            score = 0.0
-                            status = "X"
-                            feedback = f"오답: 정답 후보({', '.join(candidates)})와 불일치 (학생 답안: '{raw_ans}')"
-                        graded_results[item_no] = {
-                            "answer": raw_ans,
-                            "score": score,
-                            "status": status,
-                            "feedback": feedback,
-                            "needs_review": False,
-                        }
-                        total_student_score += score
+                        graded_results[item_no] = None  # 자리 확보(문항 순서 유지)
+                        llm_jobs.append((item_no, raw_ans, dict(
+                            prompt=rejudge_prompt,
+                            system_instruction="",
+                            max_score=max_score,
+                            default_feedback=f"오답: 정답 후보({', '.join(candidates)})와 불일치",
+                            error_feedback=f"오답: 정답 후보({', '.join(candidates)})와 불일치 (학생 답안: '{raw_ans}')",
+                            label=f"단답형 재판단({item_no})",
+                        )))
                         continue
 
                     # 재판단 끄면 상세 오답 피드백
@@ -908,30 +940,15 @@ class StudentGrader:
   "feedback": "상세 채점 피드백 (1문장)"
 }}
 """
-                        try:
-                            judge_res = self._retry(
-                                self.client.call_solar,
-                                prompt=rejudge_prompt,
-                                temperature=0.0,
-                                response_format_json=True,
-                            )
-                            res_json = self._parse_json_response(judge_res)
-                            score = max(0.0, min(max_score, float(res_json.get("score", 0.0))))
-                            status = str(res_json.get("status", "X")).upper()
-                            feedback = str(res_json.get("feedback", f"오답: 기준 정답 '{correct_ans}'과(와) 불일치"))
-                        except Exception as e:
-                            LOG.warning(f"단답형 재판단 오류({item_no}): {e}")
-                            score = 0.0
-                            status = "X"
-                            feedback = f"오답: 기준 정답 '{correct_ans}'과(와) 불일치 (학생 답안: '{raw_ans}')"
-                        graded_results[item_no] = {
-                            "answer": raw_ans,
-                            "score": score,
-                            "status": status,
-                            "feedback": feedback,
-                            "needs_review": False,
-                        }
-                        total_student_score += score
+                        graded_results[item_no] = None  # 자리 확보(문항 순서 유지)
+                        llm_jobs.append((item_no, raw_ans, dict(
+                            prompt=rejudge_prompt,
+                            system_instruction="",
+                            max_score=max_score,
+                            default_feedback=f"오답: 기준 정답 '{correct_ans}'과(와) 불일치",
+                            error_feedback=f"오답: 기준 정답 '{correct_ans}'과(와) 불일치 (학생 답안: '{raw_ans}')",
+                            label=f"단답형 재판단({item_no})",
+                        )))
                         continue
 
                     graded_results[item_no] = {
@@ -954,36 +971,39 @@ class StudentGrader:
                 student_answer=raw_ans,
             )
 
-            try:
-                llm_res = self._retry(
-                    self.client.call_solar,
-                    prompt=grade_prompt,
-                    system_instruction=(
-                        "당신은 공정한 채점관입니다. 학생 답안의 원문을 엄정하게 "
-                        "평가하여 JSON 형식으로 점수와 정오 상태를 산출하세요."
-                    ),
-                    temperature=0.0,
-                    response_format_json=True,
-                )
-                res_json = self._parse_json_response(llm_res)
-                score = float(res_json.get("score", 0))
-                score = max(0.0, min(max_score, score))
-                status = str(res_json.get("status", "X")).upper()
-                feedback = str(res_json.get("feedback", ""))
-            except Exception as e:
-                LOG.warning(f"서술형 채점 오류({item_no}): {e}")
-                score = 0.0
-                status = "X"
-                feedback = f"자동 채점 오류: {e}"
+            graded_results[item_no] = None  # 자리 확보(문항 순서 유지)
+            llm_jobs.append((item_no, raw_ans, dict(
+                prompt=grade_prompt,
+                system_instruction=(
+                    "당신은 공정한 채점관입니다. 학생 답안의 원문을 엄정하게 "
+                    "평가하여 JSON 형식으로 점수와 정오 상태를 산출하세요."
+                ),
+                max_score=max_score,
+                default_feedback="",
+                error_feedback=None,
+                label=f"서술형 채점({item_no})",
+            )))
 
-            graded_results[item_no] = {
-                "answer": raw_ans,
-                "score": score,
-                "status": status,
-                "feedback": feedback,
-                "needs_review": False,
-            }
-            total_student_score += score
+        # ------------------------------------------------------
+        # LLM이 필요한 문항(서술형 + 단답형 재판단)을 동시에 채점
+        # (기존: 문항마다 순차 호출 → 문항 수 × 응답시간만큼 대기)
+        # ------------------------------------------------------
+        if llm_jobs:
+            workers = min(self.llm_workers, len(llm_jobs))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(self._llm_judge, **kwargs): (item_no, raw_ans)
+                    for item_no, raw_ans, kwargs in llm_jobs
+                }
+                for fut in as_completed(futures):
+                    item_no, raw_ans = futures[fut]
+                    result = fut.result()
+                    result["answer"] = raw_ans
+                    graded_results[item_no] = result
+
+        total_student_score = sum(
+            float(v.get("score", 0.0)) for v in graded_results.values() if v
+        )
 
         return {
             "department": student_info.get("department", "일반"),

@@ -2,6 +2,7 @@ import os
 import io
 import json
 import requests
+from requests.adapters import HTTPAdapter
 from typing import Optional, Dict, Any, List
 
 def get_secret_api_key() -> str:
@@ -38,6 +39,10 @@ class UpstageClient:
                 "보안 설정 오류: Upstage API 키가 설정되지 않았습니다.\n"
                 "프로젝트 루트의 '.env' 파일에 UPSTAGE_API_KEY=발급받은키 를 저장해주세요. (화면에는 노출되지 않습니다)"
             )
+        # 커넥션 재사용(Keep-Alive) — 병렬 호출 시 TLS 핸드셰이크 반복 비용 제거
+        self.session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=4, pool_maxsize=32)
+        self.session.mount("https://", adapter)
             
     def _get_headers(self) -> Dict[str, str]:
         return {
@@ -52,10 +57,11 @@ class UpstageClient:
         }
         data = {
             "ocr": "force",
-            "base64_encoding": "['table', 'figure']"
+            # base64 이미지 인코딩 제거(응답 용량↓), 토큰 효율이 좋은 markdown 우선 요청
+            "output_formats": "['markdown', 'html']",
         }
         
-        response = requests.post(
+        response = self.session.post(
             self.DOCUMENT_PARSE_URL,
             headers=headers,
             files=files,
@@ -88,21 +94,25 @@ class UpstageClient:
         if response_format_json:
             payload["response_format"] = {"type": "json_object"}
             
-        response = requests.post(
+        response = self.session.post(
             self.SOLAR_CHAT_URL,
             headers=headers,
             json=payload,
-            timeout=120
+            timeout=(10, 90)
         )
         
+        if response.status_code in (429, 500, 502, 503, 504):
+            # 속도 제한/일시 장애는 상위 재시도(Exponential Backoff)에 맡김
+            raise Exception(f"Upstage Solar 일시 오류 ({response.status_code}): {response.text[:200]}")
+
         if response.status_code != 200:
             # solar-pro 실패 시 fallback으로 solar-mini 시도
             payload["model"] = "solar-mini"
-            fallback_res = requests.post(
+            fallback_res = self.session.post(
                 self.SOLAR_CHAT_URL,
                 headers=headers,
                 json=payload,
-                timeout=120
+                timeout=(10, 90)
             )
             if fallback_res.status_code != 200:
                 raise Exception(f"Upstage Solar API 호출 실패 ({response.status_code}): {response.text}")

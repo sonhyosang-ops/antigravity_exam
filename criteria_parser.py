@@ -1,6 +1,7 @@
 import json
 import re
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional
 from upstage_client import UpstageClient
 
@@ -48,8 +49,11 @@ JSON 스키마:
     def _extract_doc_text(self, file_content: bytes, filename: str) -> str:
         """단일 문서 파일에서 Upstage Document Parse로 텍스트/표 내용을 추출합니다."""
         res = self.client.parse_document(file_content, filename)
-        if "content" in res and "html" in res["content"]:
-            return res["content"]["html"]
+        content = res.get("content") or {}
+        if content.get("markdown"):
+            return content["markdown"]
+        if content.get("html"):
+            return content["html"]
         elif "elements" in res:
             return "\n".join([el.get("text", "") for el in res["elements"]])
         return str(res)
@@ -66,25 +70,24 @@ JSON 스키마:
         """
         교사가 업로드한 3가지 파일(문제지, 답안지 양식, 정답/배점표)을 각각 파싱하여 통합 채점 기준표를 도출합니다.
         """
-        combined_context = []
-        
-        # 1. 문제지 파싱
-        if question_content:
-            q_text = self._extract_doc_text(question_content, question_name)
-            combined_context.append(f"### [1. 문제지 내용 ({question_name})]\n{q_text[:7000]}\n")
-            
-        # 2. 답안지 양식 파싱
-        if template_content:
-            t_text = self._extract_doc_text(template_content, template_name)
-            combined_context.append(f"### [2. 답안지 양식 내용 ({template_name})]\n{t_text[:7000]}\n")
-            
-        # 3. 정답 및 배점기준표 파싱
-        if answer_key_content:
-            a_text = self._extract_doc_text(answer_key_content, answer_key_name)
-            combined_context.append(f"### [3. 정답 및 배점기준표 내용 ({answer_key_name})]\n{a_text[:7000]}\n")
+        docs = [
+            ("1. 문제지 내용", question_content, question_name),
+            ("2. 답안지 양식 내용", template_content, template_name),
+            ("3. 정답 및 배점기준표 내용", answer_key_content, answer_key_name),
+        ]
+        docs = [d for d in docs if d[1]]
 
-        if not combined_context:
+        if not docs:
             raise ValueError("최소 1개 이상의 시험 문서 파일(문제지, 답안지, 정답지)을 업로드해주세요.")
+
+        # 최대 3개 문서를 동시에 OCR (순차 처리 대비 대기시간 약 1/3)
+        with ThreadPoolExecutor(max_workers=len(docs)) as pool:
+            texts = list(pool.map(lambda d: self._extract_doc_text(d[1], d[2]), docs))
+
+        combined_context = [
+            f"### [{label} ({name})]\n{text[:7000]}\n"
+            for (label, _, name), text in zip(docs, texts)
+        ]
 
         full_doc_str = "\n".join(combined_context)
 
